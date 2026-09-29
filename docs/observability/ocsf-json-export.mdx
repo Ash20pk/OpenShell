@@ -58,9 +58,20 @@ do not suppress records in this explicitly enabled audit sink.
 ## Output Location
 
 For sandbox supervisors, OCSF JSON records are written to
-`/var/log/openshell-ocsf.YYYY-MM-DD.log` inside the sandbox. Windows MXC gateway
-records use `%PROGRAMDATA%\OpenShell\logs` or `OPENSHELL_OCSF_LOG_DIR`. Both
-sinks rotate daily and retain the three most recent files.
+`openshell-ocsf.YYYY-MM-DD.log` in the supervisor log directory. That is
+`/var/log` inside the sandbox by default, and can be changed with the
+supervisor's `--log-dir` flag or the `OPENSHELL_LOG_DIR` environment variable.
+The MicroVM driver runs the supervisor on the host as the gateway user, so it
+sets the directory to `logs/` under the sandbox's driver state directory, for
+example `~/.local/state/openshell/vm-driver/sandboxes/<sandbox-id>/logs/`.
+Windows MXC gateway records use `%PROGRAMDATA%\OpenShell\logs` or
+`OPENSHELL_OCSF_LOG_DIR`. All sinks rotate daily and retain the three most
+recent files.
+
+If the supervisor cannot open its log directory at startup, it logs a warning
+and runs with stderr-only logging. Enabling `ocsf_json_enabled` then logs a
+warning that no JSONL sink is available instead of reporting the toggle, and no
+records are written until the supervisor restarts with a writable directory.
 
 ## JSON Record Structure
 

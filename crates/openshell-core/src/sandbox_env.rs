@@ -26,6 +26,13 @@ pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 /// Log level for the sandbox supervisor (e.g. `"debug"`, `"info"`, `"warn"`).
 pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 
+/// Directory for the sandbox supervisor's rotating log files.
+///
+/// This includes the OCSF JSONL audit sink. Defaults to `/var/log`. Drivers
+/// whose supervisor cannot write there (the VM driver runs it as the gateway
+/// user on the host) point this at a directory they own.
+pub const LOG_DIR: &str = "OPENSHELL_LOG_DIR";
+
 /// Versioned specification for the exact canonical main process.
 ///
 /// Most drivers use JSON directly. Transports that cannot preserve spaces in

@@ -629,6 +629,7 @@ pub async fn run_sandbox(
     health_socket_path: Option<std::path::PathBuf>,
     health_port: Option<u16>,
     ocsf_enabled: Arc<AtomicBool>,
+    ocsf_sink: Option<std::path::PathBuf>,
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
     backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
@@ -1093,6 +1094,7 @@ pub async fn run_sandbox(
             entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
+            ocsf_sink,
             ocsf_schema_version: poll_ocsf_schema_version,
             provider_credentials: poll_provider_credentials,
             provider_readiness: provider_readiness.clone(),
@@ -3365,6 +3367,8 @@ struct PolicyPollLoopContext {
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<AtomicBool>,
+    /// Directory the OCSF JSONL sink writes to, when one could be opened.
+    ocsf_sink: Option<std::path::PathBuf>,
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     provider_credentials: ProviderCredentialState,
     provider_readiness: ProviderReadinessTracker,
@@ -3886,7 +3890,11 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                         generation.clone(),
                     );
                     current_policy_generation = Some(generation.clone());
-                    apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_ocsf_json_setting(
+                        &ctx.ocsf_enabled,
+                        ctx.ocsf_sink.as_deref(),
+                        &result.settings,
+                    );
                     apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
@@ -3925,7 +3933,11 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     pending_result = Some(result);
                 }
                 (InitialPollDisposition::TrackOnly, _) => {
-                    apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_ocsf_json_setting(
+                        &ctx.ocsf_enabled,
+                        ctx.ocsf_sink.as_deref(),
+                        &result.settings,
+                    );
                     apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
@@ -4534,7 +4546,11 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         }
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
-        apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+        apply_ocsf_json_setting(
+            &ctx.ocsf_enabled,
+            ctx.ocsf_sink.as_deref(),
+            &result.settings,
+        );
         apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
 
         // Apply the agent-proposals feature toggle. On a false→true transition
@@ -4565,16 +4581,33 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     }
 }
 
+/// Applies `ocsf_json_enabled`. Enabling it without a JSONL sink (the log
+/// directory could not be opened at startup) is reported as a warning rather
+/// than a successful toggle, so an operator is not left believing records are
+/// being written.
 fn apply_ocsf_json_setting(
     enabled: &AtomicBool,
+    sink: Option<&std::path::Path>,
     settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
 ) {
     use std::sync::atomic::Ordering;
 
     let new_ocsf = extract_bool_setting(settings, "ocsf_json_enabled").unwrap_or(false);
     let prev_ocsf = enabled.swap(new_ocsf, Ordering::Relaxed);
-    if new_ocsf != prev_ocsf {
-        info!(ocsf_json_enabled = new_ocsf, "OCSF JSONL logging toggled");
+    if new_ocsf == prev_ocsf {
+        return;
+    }
+    match sink {
+        Some(dir) => info!(
+            ocsf_json_enabled = new_ocsf,
+            log_dir = %dir.display(),
+            "OCSF JSONL logging toggled"
+        ),
+        None if new_ocsf => warn!(
+            "ocsf_json_enabled is set but no OCSF JSONL sink is available; records are not \
+             written. Point OPENSHELL_LOG_DIR at a directory the supervisor can write"
+        ),
+        None => info!(ocsf_json_enabled = new_ocsf, "OCSF JSONL logging toggled"),
     }
 }
 
@@ -5003,7 +5036,21 @@ mod tests {
         let mut settings = std::collections::HashMap::new();
         settings.insert("ocsf_json_enabled".to_string(), effective_bool(true));
 
-        apply_ocsf_json_setting(&enabled, &settings);
+        apply_ocsf_json_setting(&enabled, Some(std::path::Path::new("/var/log")), &settings);
+
+        assert!(enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apply_ocsf_json_setting_still_tracks_the_setting_without_a_sink() {
+        // The flag mirrors the setting either way; the difference is only the
+        // warning the operator sees, so the sink becomes usable again on a
+        // restart with a writable log directory.
+        let enabled = AtomicBool::new(false);
+        let mut settings = std::collections::HashMap::new();
+        settings.insert("ocsf_json_enabled".to_string(), effective_bool(true));
+
+        apply_ocsf_json_setting(&enabled, None, &settings);
 
         assert!(enabled.load(Ordering::Relaxed));
     }
@@ -5013,7 +5060,7 @@ mod tests {
         let enabled = AtomicBool::new(true);
         let settings = std::collections::HashMap::new();
 
-        apply_ocsf_json_setting(&enabled, &settings);
+        apply_ocsf_json_setting(&enabled, None, &settings);
 
         assert!(!enabled.load(Ordering::Relaxed));
     }
@@ -6384,6 +6431,7 @@ network_policies:
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
             interval_secs: 0,
             ocsf_enabled: Arc::new(AtomicBool::new(false)),
+            ocsf_sink: None,
             ocsf_schema_version: Arc::new(std::sync::Mutex::new(String::new())),
             provider_credentials,
             provider_readiness,

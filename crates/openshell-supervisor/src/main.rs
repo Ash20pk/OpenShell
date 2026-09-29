@@ -80,6 +80,10 @@ struct Args {
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
 
+    /// Directory for rotating supervisor logs and the OCSF JSONL audit sink.
+    #[arg(long, default_value = "/var/log", env = openshell_core::sandbox_env::LOG_DIR)]
+    log_dir: PathBuf,
+
     /// Create the private readiness socket after boundary and gateway attach.
     #[arg(long, env = "OPENSHELL_HEALTH_SOCKET_PATH")]
     health_socket_path: Option<PathBuf>,
@@ -310,12 +314,13 @@ fn main() -> Result<()> {
         None
     };
 
+    let log_dir = args.log_dir.clone();
     let file_logging = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("openshell")
         .filename_suffix("log")
         .max_log_files(3)
-        .build("/var/log")
+        .build(&log_dir)
         .ok()
         .map(|roller| {
             let (writer, guard) = tracing_appender::non_blocking(roller);
@@ -348,50 +353,56 @@ fn main() -> Result<()> {
         let ocsf_enabled = Arc::new(AtomicBool::new(false));
         let ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
 
-        let (_file_guard, _jsonl_guard) = if let Some((file_writer, file_guard)) = file_logging {
-            let jsonl_logging = tracing_appender::rolling::RollingFileAppender::builder()
-                .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .filename_prefix("openshell-ocsf")
-                .filename_suffix("log")
-                .max_log_files(3)
-                .build("/var/log")
-                .ok()
-                .map(|roller| {
-                    let (writer, guard) = tracing_appender::non_blocking(roller);
-                    let layer = OcsfJsonlLayer::new(writer)
-                        .with_enabled_flag(ocsf_enabled.clone())
-                        .with_target_version(ocsf_schema_version.clone());
-                    (layer, guard)
-                });
-            let (jsonl_layer, jsonl_guard) =
-                jsonl_logging.map_or((None, None), |(layer, guard)| (Some(layer), Some(guard)));
-            tracing_subscriber::registry()
-                .with(
-                    OcsfShorthandLayer::new(std::io::stderr())
-                        .with_non_ocsf(true)
-                        .with_filter(console_filter),
-                )
-                .with(
-                    OcsfShorthandLayer::new(file_writer)
-                        .with_non_ocsf(true)
-                        .with_filter(EnvFilter::new("info")),
-                )
-                .with(jsonl_layer.with_filter(LevelFilter::INFO))
-                .with(push_layer.clone())
-                .init();
-            (Some(file_guard), jsonl_guard)
-        } else {
-            tracing_subscriber::registry()
-                .with(
-                    OcsfShorthandLayer::new(std::io::stderr())
-                        .with_non_ocsf(true)
-                        .with_filter(console_filter),
-                )
-                .with(push_layer)
-                .init();
-            warn!("Could not open /var/log for log rotation; using stderr-only logging");
-            (None, None)
-        };
+        let (_file_guard, _jsonl_guard, ocsf_sink) =
+            if let Some((file_writer, file_guard)) = file_logging {
+                let jsonl_logging = tracing_appender::rolling::RollingFileAppender::builder()
+                    .rotation(tracing_appender::rolling::Rotation::DAILY)
+                    .filename_prefix("openshell-ocsf")
+                    .filename_suffix("log")
+                    .max_log_files(3)
+                    .build(&log_dir)
+                    .ok()
+                    .map(|roller| {
+                        let (writer, guard) = tracing_appender::non_blocking(roller);
+                        let layer = OcsfJsonlLayer::new(writer)
+                            .with_enabled_flag(ocsf_enabled.clone())
+                            .with_target_version(ocsf_schema_version.clone());
+                        (layer, guard)
+                    });
+                let (jsonl_layer, jsonl_guard) =
+                    jsonl_logging.map_or((None, None), |(layer, guard)| (Some(layer), Some(guard)));
+                tracing_subscriber::registry()
+                    .with(
+                        OcsfShorthandLayer::new(std::io::stderr())
+                            .with_non_ocsf(true)
+                            .with_filter(console_filter),
+                    )
+                    .with(
+                        OcsfShorthandLayer::new(file_writer)
+                            .with_non_ocsf(true)
+                            .with_filter(EnvFilter::new("info")),
+                    )
+                    .with(jsonl_layer.with_filter(LevelFilter::INFO))
+                    .with(push_layer.clone())
+                    .init();
+                let ocsf_sink = jsonl_guard.as_ref().map(|_| log_dir.clone());
+                (Some(file_guard), jsonl_guard, ocsf_sink)
+            } else {
+                tracing_subscriber::registry()
+                    .with(
+                        OcsfShorthandLayer::new(std::io::stderr())
+                            .with_non_ocsf(true)
+                            .with_filter(console_filter),
+                    )
+                    .with(push_layer)
+                    .init();
+                warn!(
+                    log_dir = %log_dir.display(),
+                    "Could not open the log directory for log rotation; using stderr-only logging. \
+                     OCSF JSON export needs a writable OPENSHELL_LOG_DIR"
+                );
+                (None, None, None)
+            };
 
         let workdir = args.workdir.clone();
         let (command, interactive, await_main_process_attachment) = if !args.command.is_empty() {
@@ -446,6 +457,7 @@ fn main() -> Result<()> {
                     args.health_socket_path,
                     args.health_port,
                     ocsf_enabled,
+                    ocsf_sink,
                     ocsf_schema_version,
                     upstream_proxy_args,
                     backend_descriptor,

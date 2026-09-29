@@ -918,6 +918,10 @@ impl VmDriver {
         .map_err(|error| Status::internal(format!("encode main process spec: {error}")))?;
         let upstream_proxy_args = upstream_proxy_cli_args(&self.config)
             .map_err(|error| Status::invalid_argument(format!("render upstream proxy: {error}")))?;
+        let supervisor_log_dir = state_dir.join("logs");
+        fs::create_dir_all(&supervisor_log_dir).map_err(|error| {
+            Status::internal(format!("create supervisor log directory: {error}"))
+        })?;
         let mut command = Command::new(&supervisor_binary);
         isolate_host_control_environment(&mut command);
         command
@@ -971,6 +975,10 @@ impl VmDriver {
                 openshell_core::sandbox_env::LOG_LEVEL,
                 openshell_core::driver_utils::sandbox_log_level(sandbox, &self.config.log_level),
             )
+            // The host supervisor runs as the gateway user and cannot write
+            // /var/log; keep its rotating logs and the OCSF JSONL sink with
+            // the rest of the sandbox state.
+            .env(openshell_core::sandbox_env::LOG_DIR, &supervisor_log_dir)
             .env(
                 openshell_core::sandbox_env::TELEMETRY_ENABLED,
                 openshell_core::telemetry::enabled_env_value(),
